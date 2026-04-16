@@ -1,0 +1,1528 @@
+/**
+ * @file servo_basic_control.c
+ * @brief Protocol adapter for servo/ESC control commands.
+ */
+
+#include "servo_basic_control.h"
+#include <stddef.h>
+#include <math.h>
+#include <string.h>
+#include "FreeRTOS.h"
+#include "queue.h"
+#include "task.h"
+#include "servo_rc_capture.h"
+
+#ifndef SERVO_BASIC_LOG
+#define SERVO_BASIC_LOG(...) ((void)0)
+#endif
+
+static servo_basic_state_t g_state = {
+	ESC_PWM_NEUTRAL_PULSE_US,
+	ESC_PWM_NEUTRAL_PULSE_US,
+	SERVO_CTRL_MODE_AUTONOMOUS,
+	0U,
+	0U
+};
+
+#define RC_OVERRIDE_CENTER_DEFAULT_US             1500U
+#define RC_OVERRIDE_ENTER_THRESHOLD_DEFAULT_US     60U
+#define RC_OVERRIDE_EXIT_THRESHOLD_DEFAULT_US      40U
+#define RC_OVERRIDE_ENTER_SAMPLES_DEFAULT           2U
+#define RC_OVERRIDE_RELEASE_HOLD_DEFAULT_MS       500U
+#define RC_GUARD_ACTIVE_LOW_THRESHOLD_DEFAULT_US 1300U
+#define RC_GUARD_ACTIVE_HIGH_THRESHOLD_DEFAULT_US 1700U
+#define ORIN_ACKERMANN_WHEELBASE_DEFAULT_MM       540U
+#define ORIN_ACKERMANN_TRACK_WIDTH_DEFAULT_MM     480U
+#define ORIN_ACKERMANN_WHEEL_RADIUS_DEFAULT_MM    110U
+#define ORIN_ACKERMANN_MAX_STEERING_DEFAULT_MRAD  393U
+#define ORIN_ACKERMANN_MIN_VX_DEFAULT_MMPS         50U
+#define ORIN_VX_SCALE_DEFAULT_PERMILLE           1000U
+#define ORIN_VX_FORWARD_CAP_DEFAULT_MMPS         2000U
+#define ORIN_VX_REVERSE_CAP_DEFAULT_MMPS         2000U
+#define ORIN_VX_DEADBAND_DEFAULT_MMPS              50U
+#define ORIN_ESC_FORWARD_START_DEFAULT_US        1560U
+#define ORIN_ESC_REVERSE_START_DEFAULT_US        1440U
+#define ORIN_ESC_FORWARD_MAX_DEFAULT_US          1650U
+#define ORIN_ESC_REVERSE_MAX_DEFAULT_US          1350U
+#define RC_VALID_MIN_DEFAULT_US                   900U
+#define RC_VALID_MAX_DEFAULT_US                  2100U
+#define RC_FRAME_MIN_DEFAULT_US                  5000U
+#define RC_FRAME_MAX_DEFAULT_US                 30000U
+#define RC_GLITCH_FREEZE_DEFAULT_MS              100U
+#define RC_THROTTLE_NEUTRAL_HOLD_DEFAULT_US       25U
+#define RC_THROTTLE_JUMP_CONFIRM_DEFAULT_US       40U
+#define RC_STEERING_JUMP_CONFIRM_DEFAULT_US       80U
+#define RC_JUMP_CONFIRM_SAMPLES_DEFAULT            2U
+
+// Debug trigger variables (set from Keil Watch/Command).
+volatile uint32_t g_debug_servo_trigger = 0U;
+volatile uint32_t g_debug_servo_can_id = SERVO_CAN_ID_0;
+volatile uint32_t g_debug_servo_cmd = SERVO_CMD_SET_SERVO_ANGLE;
+volatile uint32_t g_debug_servo_value = 90U;
+
+// RC raw PWM follow (bypass 1000-2000 us clamp when non-zero).
+volatile uint32_t g_rc_pwm_follow_raw = 0U;
+// RC signal timeout in milliseconds (0 uses default 100 ms).
+volatile uint32_t g_rc_signal_timeout_ms = 100U;
+// Orin kinematics to PWM settings (set from Keil Watch).
+volatile uint32_t g_orin_pwm_enable = 1U;
+volatile uint32_t g_orin_pwm_timeout_ms = 200U;
+volatile uint32_t g_orin_ackermann_wheelbase_mm = ORIN_ACKERMANN_WHEELBASE_DEFAULT_MM;
+volatile uint32_t g_orin_ackermann_track_width_mm = ORIN_ACKERMANN_TRACK_WIDTH_DEFAULT_MM;
+volatile uint32_t g_orin_ackermann_wheel_radius_mm = ORIN_ACKERMANN_WHEEL_RADIUS_DEFAULT_MM;
+volatile uint32_t g_orin_ackermann_max_steering_millirad = ORIN_ACKERMANN_MAX_STEERING_DEFAULT_MRAD;
+volatile uint32_t g_orin_ackermann_min_vx_mmps = ORIN_ACKERMANN_MIN_VX_DEFAULT_MMPS;
+volatile uint32_t g_orin_vx_scale = ORIN_VX_SCALE_DEFAULT_PERMILLE;
+volatile uint32_t g_orin_vx_forward_cap_mmps = ORIN_VX_FORWARD_CAP_DEFAULT_MMPS;
+volatile uint32_t g_orin_vx_reverse_cap_mmps = ORIN_VX_REVERSE_CAP_DEFAULT_MMPS;
+volatile uint32_t g_orin_vx_deadband_mmps = ORIN_VX_DEADBAND_DEFAULT_MMPS;
+volatile uint32_t g_orin_vx_max_mmps = 1000U;
+volatile uint32_t g_orin_vz_max_millirad = 1000U;
+volatile uint32_t g_orin_esc_center_us = ESC_PWM_NEUTRAL_PULSE_US;
+volatile uint32_t g_orin_esc_range_us = 500U;
+volatile uint32_t g_orin_esc_forward_start_us = ORIN_ESC_FORWARD_START_DEFAULT_US;
+volatile uint32_t g_orin_esc_reverse_start_us = ORIN_ESC_REVERSE_START_DEFAULT_US;
+volatile uint32_t g_orin_esc_forward_max_us = ORIN_ESC_FORWARD_MAX_DEFAULT_US;
+volatile uint32_t g_orin_esc_reverse_max_us = ORIN_ESC_REVERSE_MAX_DEFAULT_US;
+volatile uint32_t g_orin_servo_center_us = ESC_PWM_NEUTRAL_PULSE_US;
+volatile uint32_t g_orin_servo_range_us = 500U;
+// RC debounce parameters (set from Keil Watch).
+volatile uint32_t g_rc_debounce_enable = 1U;
+volatile uint32_t g_rc_debounce_deadband_us = 5U;
+volatile uint32_t g_rc_debounce_smooth_div = 4U;
+volatile uint32_t g_rc_valid_min_us = RC_VALID_MIN_DEFAULT_US;
+volatile uint32_t g_rc_valid_max_us = RC_VALID_MAX_DEFAULT_US;
+volatile uint32_t g_rc_frame_min_us = RC_FRAME_MIN_DEFAULT_US;
+volatile uint32_t g_rc_frame_max_us = RC_FRAME_MAX_DEFAULT_US;
+volatile uint32_t g_rc_glitch_freeze_ms = RC_GLITCH_FREEZE_DEFAULT_MS;
+volatile uint32_t g_rc_throttle_neutral_hold_us = RC_THROTTLE_NEUTRAL_HOLD_DEFAULT_US;
+volatile uint32_t g_rc_throttle_jump_confirm_us = RC_THROTTLE_JUMP_CONFIRM_DEFAULT_US;
+volatile uint32_t g_rc_steering_jump_confirm_us = RC_STEERING_JUMP_CONFIRM_DEFAULT_US;
+volatile uint32_t g_rc_jump_confirm_samples = RC_JUMP_CONFIRM_SAMPLES_DEFAULT;
+// RC override thresholds (set from Keil Watch).
+volatile uint32_t g_rc_override_center_us = RC_OVERRIDE_CENTER_DEFAULT_US;
+volatile uint32_t g_rc_override_enter_threshold_us = RC_OVERRIDE_ENTER_THRESHOLD_DEFAULT_US;
+volatile uint32_t g_rc_override_exit_threshold_us = RC_OVERRIDE_EXIT_THRESHOLD_DEFAULT_US;
+volatile uint32_t g_rc_override_enter_samples = RC_OVERRIDE_ENTER_SAMPLES_DEFAULT;
+volatile uint32_t g_rc_override_release_hold_ms = RC_OVERRIDE_RELEASE_HOLD_DEFAULT_MS;
+volatile uint32_t g_rc_guard_enable = 1U;
+volatile uint32_t g_rc_guard_active_high = 1U;
+volatile uint32_t g_rc_guard_active_low_threshold_us = RC_GUARD_ACTIVE_LOW_THRESHOLD_DEFAULT_US;
+volatile uint32_t g_rc_guard_active_high_threshold_us = RC_GUARD_ACTIVE_HIGH_THRESHOLD_DEFAULT_US;
+volatile uint32_t g_rc_throttle_last_good_us = ESC_PWM_NEUTRAL_PULSE_US;
+volatile uint32_t g_rc_steering_last_good_us = ESC_PWM_NEUTRAL_PULSE_US;
+volatile uint32_t g_rc_throttle_glitch_active = 0U;
+volatile uint32_t g_rc_steering_glitch_active = 0U;
+volatile uint32_t g_rc_input_fault_active = 0U;
+
+typedef struct
+{
+	uint32_t can_id;
+	uint8_t payload_len;
+	uint8_t payload[8];
+} servo_basic_msg_t;
+
+typedef struct
+{
+	uint16_t esc_pulse_us;
+	uint16_t servo_pulse_us;
+	uint32_t last_update_ms;
+	float feedback_vx_mps;
+	float feedback_vy_mps;
+	float feedback_vz_rad_s;
+	uint8_t active;
+	uint8_t stop;
+} orin_pwm_state_t;
+
+typedef struct
+{
+	uint16_t filter_state;
+	uint16_t last_good_us;
+	uint16_t candidate_us;
+	uint16_t output_us;
+	uint32_t invalid_since_ms;
+	uint8_t candidate_count;
+	uint8_t glitch_active;
+	uint8_t stable_present;
+} rc_channel_filter_state_t;
+
+static QueueHandle_t g_servo_basic_queue = NULL;
+static orin_pwm_state_t g_orin_state = {
+	ESC_PWM_NEUTRAL_PULSE_US,
+	ESC_PWM_NEUTRAL_PULSE_US,
+	0U,
+	0.0f,
+	0.0f,
+	0.0f,
+	0U,
+	0U
+};
+static volatile uint8_t g_rc_override_active = 0U;
+static volatile uint8_t g_rc_guard_active = 0U;
+static uint8_t g_rc_override_enter_count = 0U;
+static uint32_t g_rc_override_release_start_ms = 0U;
+static uint16_t g_rc_throttle_current = 0U;
+static uint16_t g_rc_steering_current = 0U;
+static uint16_t g_rc_guard_current = 0U;
+static uint8_t g_rc_throttle_present = 0U;
+static uint8_t g_rc_steering_present = 0U;
+static uint8_t g_rc_guard_present = 0U;
+static rc_channel_filter_state_t g_rc_throttle_state = {0U};
+static rc_channel_filter_state_t g_rc_steering_state = {0U};
+static uint8_t g_autonomous_target_valid = 0U;
+
+static uint16_t limit_esc_safe_pulse(uint16_t pulse_us);
+static uint16_t limit_servo_safe_pulse(uint16_t pulse_us);
+static uint32_t get_rc_override_center_us(void);
+static uint8_t pulse_is_inside_center(uint16_t pulse_us, uint32_t center_us, uint32_t threshold_us);
+static uint8_t orin_pwm_is_active(void);
+
+__attribute__((weak)) void ServoBasic_OutputEscPulse(uint16_t pulse_us)
+{
+	(void)pulse_us;
+}
+
+__attribute__((weak)) void ServoBasic_OutputServoPulse(uint16_t pulse_us)
+{
+	(void)pulse_us;
+}
+
+static uint16_t clamp_servo_angle(uint16_t angle_deg)
+{
+	return (angle_deg > 180U) ? 180U : angle_deg;
+}
+
+static uint16_t servo_angle_to_pulse(uint16_t angle_deg)
+{
+	const uint32_t servo_range = SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US;
+	return (uint16_t)(SERVO_MIN_PULSE_US +
+					  ((uint32_t)angle_deg * servo_range) / 180U);
+}
+
+static uint8_t clamp_servo_step(uint8_t step)
+{
+	const uint8_t max_step = (uint8_t)((SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) / SERVO_PULSE_STEP_US);
+	return (step > max_step) ? max_step : step;
+}
+
+static uint16_t servo_step_to_pulse(uint8_t step)
+{
+	return (uint16_t)(SERVO_MIN_PULSE_US + (uint32_t)step * SERVO_PULSE_STEP_US);
+}
+
+static uint16_t clamp_esc_pulse(uint16_t pulse_us)
+{
+	if (pulse_us < ESC_PWM_MIN_PULSE_US)
+	{
+		return ESC_PWM_MIN_PULSE_US;
+	}
+	if (pulse_us > ESC_PWM_MAX_PULSE_US)
+	{
+		return ESC_PWM_MAX_PULSE_US;
+	}
+	return pulse_us;
+}
+
+static uint16_t clamp_servo_pulse(uint16_t pulse_us)
+{
+	if (pulse_us < SERVO_MIN_PULSE_US)
+	{
+		return SERVO_MIN_PULSE_US;
+	}
+	if (pulse_us > SERVO_MAX_PULSE_US)
+	{
+		return SERVO_MAX_PULSE_US;
+	}
+	return pulse_us;
+}
+
+static uint16_t rc_select_pulse(uint16_t pulse_us, uint8_t is_esc)
+{
+	if (is_esc != 0U)
+	{
+		return limit_esc_safe_pulse(pulse_us);
+	}
+	if (g_rc_pwm_follow_raw != 0U)
+	{
+		return limit_servo_safe_pulse(pulse_us);
+	}
+	return limit_servo_safe_pulse(clamp_servo_pulse(pulse_us));
+}
+
+static void rc_debounce_reset(void)
+{
+	memset(&g_rc_throttle_state, 0, sizeof(g_rc_throttle_state));
+	memset(&g_rc_steering_state, 0, sizeof(g_rc_steering_state));
+	g_rc_throttle_current = 0U;
+	g_rc_steering_current = 0U;
+	g_rc_guard_current = 0U;
+	g_rc_throttle_last_good_us = ESC_PWM_NEUTRAL_PULSE_US;
+	g_rc_steering_last_good_us = ESC_PWM_NEUTRAL_PULSE_US;
+	g_rc_throttle_glitch_active = 0U;
+	g_rc_steering_glitch_active = 0U;
+	g_rc_input_fault_active = 0U;
+}
+
+static uint16_t rc_debounce_apply(uint16_t raw, uint16_t *state)
+{
+	if (raw == 0U)
+	{
+		return 0U;
+	}
+	if (g_rc_debounce_enable == 0U)
+	{
+		*state = raw;
+		return raw;
+	}
+	if (*state == 0U)
+	{
+		*state = raw;
+		return raw;
+	}
+
+	uint32_t deadband = g_rc_debounce_deadband_us;
+	uint32_t diff = (raw > *state) ? (raw - *state) : (*state - raw);
+	if (deadband != 0U && diff <= deadband)
+	{
+		return *state;
+	}
+
+	uint32_t div = g_rc_debounce_smooth_div;
+	if (div < 1U)
+	{
+		div = 1U;
+	}
+	else if (div > 16U)
+	{
+		div = 16U;
+	}
+
+	int32_t delta = (int32_t)raw - (int32_t)*state;
+	int32_t step = delta / (int32_t)div;
+	if (step == 0)
+	{
+		step = (delta > 0) ? 1 : -1;
+	}
+	*state = (uint16_t)((int32_t)*state + step);
+	return *state;
+}
+
+static uint32_t get_rc_glitch_freeze_ms(void)
+{
+	return (g_rc_glitch_freeze_ms == 0U) ? RC_GLITCH_FREEZE_DEFAULT_MS : g_rc_glitch_freeze_ms;
+}
+
+static uint32_t get_rc_throttle_neutral_hold_us(void)
+{
+	return (g_rc_throttle_neutral_hold_us == 0U) ? RC_THROTTLE_NEUTRAL_HOLD_DEFAULT_US :
+		g_rc_throttle_neutral_hold_us;
+}
+
+static uint32_t get_rc_throttle_jump_confirm_us(void)
+{
+	return (g_rc_throttle_jump_confirm_us == 0U) ? RC_THROTTLE_JUMP_CONFIRM_DEFAULT_US :
+		g_rc_throttle_jump_confirm_us;
+}
+
+static uint32_t get_rc_steering_jump_confirm_us(void)
+{
+	return (g_rc_steering_jump_confirm_us == 0U) ? RC_STEERING_JUMP_CONFIRM_DEFAULT_US :
+		g_rc_steering_jump_confirm_us;
+}
+
+static uint32_t get_rc_jump_confirm_samples(void)
+{
+	return (g_rc_jump_confirm_samples == 0U) ? RC_JUMP_CONFIRM_SAMPLES_DEFAULT :
+		g_rc_jump_confirm_samples;
+}
+
+static uint32_t pulse_diff(uint16_t a, uint16_t b)
+{
+	return (a > b) ? ((uint32_t)a - (uint32_t)b) : ((uint32_t)b - (uint32_t)a);
+}
+
+static uint16_t finalize_rc_channel_pulse(rc_channel_filter_state_t *state, uint16_t pulse_us, uint8_t is_throttle)
+{
+	uint16_t filtered = pulse_us;
+
+	if (state == NULL || pulse_us == 0U)
+	{
+		return 0U;
+	}
+
+	if (is_throttle != 0U)
+	{
+		filtered = rc_debounce_apply(pulse_us, &state->filter_state);
+		if (pulse_is_inside_center(filtered, get_rc_override_center_us(), get_rc_throttle_neutral_hold_us()) != 0U)
+		{
+			filtered = (uint16_t)get_rc_override_center_us();
+			state->filter_state = filtered;
+		}
+	}
+	else
+	{
+		filtered = rc_debounce_apply(pulse_us, &state->filter_state);
+	}
+
+	state->last_good_us = filtered;
+	return filtered;
+}
+
+static void update_rc_channel_state(rc_channel_filter_state_t *state,
+									uint16_t raw,
+									uint8_t raw_present,
+									uint8_t fault_active,
+									uint32_t now_ms,
+									uint8_t is_throttle)
+{
+	uint32_t jump_threshold;
+	uint32_t confirm_samples;
+
+	if (state == NULL)
+	{
+		return;
+	}
+
+	state->stable_present = 0U;
+
+	if (raw_present == 0U || raw == 0U)
+	{
+		state->filter_state = 0U;
+		state->candidate_us = 0U;
+		state->candidate_count = 0U;
+		state->output_us = 0U;
+		state->invalid_since_ms = 0U;
+		state->glitch_active = 0U;
+		return;
+	}
+
+	if (fault_active != 0U)
+	{
+		state->candidate_us = 0U;
+		state->candidate_count = 0U;
+		state->glitch_active = 1U;
+		if (state->invalid_since_ms == 0U)
+		{
+			state->invalid_since_ms = now_ms;
+		}
+
+		if (state->last_good_us != 0U &&
+			(now_ms - state->invalid_since_ms) < get_rc_glitch_freeze_ms())
+		{
+			state->output_us = state->last_good_us;
+			state->stable_present = 1U;
+		}
+		else
+		{
+			state->output_us = 0U;
+			state->stable_present = 0U;
+		}
+		return;
+	}
+
+	state->invalid_since_ms = 0U;
+	jump_threshold = (is_throttle != 0U) ? get_rc_throttle_jump_confirm_us() :
+		get_rc_steering_jump_confirm_us();
+	confirm_samples = get_rc_jump_confirm_samples();
+	if (confirm_samples < 1U)
+	{
+		confirm_samples = 1U;
+	}
+
+	if (state->last_good_us == 0U || state->filter_state == 0U)
+	{
+		state->candidate_us = 0U;
+		state->candidate_count = 0U;
+		state->glitch_active = 0U;
+		state->filter_state = raw;
+		state->output_us = finalize_rc_channel_pulse(state, raw, is_throttle);
+		state->stable_present = 1U;
+		return;
+	}
+
+	if (jump_threshold != 0U && pulse_diff(raw, state->last_good_us) > jump_threshold)
+	{
+		if (state->candidate_count == 0U || pulse_diff(raw, state->candidate_us) > jump_threshold)
+		{
+			state->candidate_us = raw;
+			state->candidate_count = 1U;
+			state->glitch_active = 1U;
+			state->output_us = state->last_good_us;
+			state->stable_present = 1U;
+			return;
+		}
+
+		if (state->candidate_count < confirm_samples)
+		{
+			state->candidate_count++;
+		}
+
+		if (state->candidate_count < confirm_samples)
+		{
+			state->glitch_active = 1U;
+			state->output_us = state->last_good_us;
+			state->stable_present = 1U;
+			return;
+		}
+
+		state->filter_state = raw;
+		raw = state->candidate_us;
+	}
+
+	state->candidate_us = 0U;
+	state->candidate_count = 0U;
+	state->glitch_active = 0U;
+	state->output_us = finalize_rc_channel_pulse(state, raw, is_throttle);
+	state->stable_present = 1U;
+}
+
+static uint32_t get_rc_signal_timeout_ms(void)
+{
+	return (g_rc_signal_timeout_ms == 0U) ? 100U : g_rc_signal_timeout_ms;
+}
+
+static uint32_t get_rc_override_center_us(void)
+{
+	return (g_rc_override_center_us == 0U) ? RC_OVERRIDE_CENTER_DEFAULT_US : g_rc_override_center_us;
+}
+
+static uint32_t get_rc_override_enter_threshold_us(void)
+{
+	return (g_rc_override_enter_threshold_us == 0U) ? RC_OVERRIDE_ENTER_THRESHOLD_DEFAULT_US : g_rc_override_enter_threshold_us;
+}
+
+static uint32_t get_rc_override_exit_threshold_us(void)
+{
+	return (g_rc_override_exit_threshold_us == 0U) ? RC_OVERRIDE_EXIT_THRESHOLD_DEFAULT_US : g_rc_override_exit_threshold_us;
+}
+
+static uint32_t get_rc_override_enter_samples(void)
+{
+	return (g_rc_override_enter_samples == 0U) ? RC_OVERRIDE_ENTER_SAMPLES_DEFAULT : g_rc_override_enter_samples;
+}
+
+static uint32_t get_rc_override_release_hold_ms(void)
+{
+	return (g_rc_override_release_hold_ms == 0U) ? RC_OVERRIDE_RELEASE_HOLD_DEFAULT_MS : g_rc_override_release_hold_ms;
+}
+
+static uint32_t get_orin_ackermann_wheelbase_mm(void)
+{
+	return (g_orin_ackermann_wheelbase_mm == 0U) ? ORIN_ACKERMANN_WHEELBASE_DEFAULT_MM : g_orin_ackermann_wheelbase_mm;
+}
+
+static uint32_t get_orin_ackermann_track_width_mm(void)
+{
+	return (g_orin_ackermann_track_width_mm == 0U) ? ORIN_ACKERMANN_TRACK_WIDTH_DEFAULT_MM : g_orin_ackermann_track_width_mm;
+}
+
+static uint32_t get_orin_ackermann_wheel_radius_mm(void)
+{
+	return (g_orin_ackermann_wheel_radius_mm == 0U) ? ORIN_ACKERMANN_WHEEL_RADIUS_DEFAULT_MM : g_orin_ackermann_wheel_radius_mm;
+}
+
+static uint32_t get_orin_ackermann_max_steering_millirad(void)
+{
+	return (g_orin_ackermann_max_steering_millirad == 0U) ? ORIN_ACKERMANN_MAX_STEERING_DEFAULT_MRAD :
+		g_orin_ackermann_max_steering_millirad;
+}
+
+static uint32_t get_orin_ackermann_min_vx_mmps(void)
+{
+	return (g_orin_ackermann_min_vx_mmps == 0U) ? ORIN_ACKERMANN_MIN_VX_DEFAULT_MMPS : g_orin_ackermann_min_vx_mmps;
+}
+
+static uint32_t get_orin_vx_scale_permille(void)
+{
+	return (g_orin_vx_scale == 0U) ? ORIN_VX_SCALE_DEFAULT_PERMILLE : g_orin_vx_scale;
+}
+
+static uint32_t get_orin_vx_forward_cap_mmps(void)
+{
+	if (g_orin_vx_forward_cap_mmps != 0U)
+	{
+		return g_orin_vx_forward_cap_mmps;
+	}
+	return (g_orin_vx_max_mmps == 0U) ? ORIN_VX_FORWARD_CAP_DEFAULT_MMPS : g_orin_vx_max_mmps;
+}
+
+static uint32_t get_orin_vx_reverse_cap_mmps(void)
+{
+	if (g_orin_vx_reverse_cap_mmps != 0U)
+	{
+		return g_orin_vx_reverse_cap_mmps;
+	}
+	return (g_orin_vx_max_mmps == 0U) ? ORIN_VX_REVERSE_CAP_DEFAULT_MMPS : g_orin_vx_max_mmps;
+}
+
+static uint32_t get_orin_vx_deadband_mmps(void)
+{
+	return (g_orin_vx_deadband_mmps == 0U) ? ORIN_VX_DEADBAND_DEFAULT_MMPS : g_orin_vx_deadband_mmps;
+}
+
+static uint16_t get_orin_esc_center_pulse(void)
+{
+	uint32_t pulse = g_orin_esc_center_us;
+	if (pulse < ESC_PWM_MIN_PULSE_US)
+	{
+		pulse = ESC_PWM_MIN_PULSE_US;
+	}
+	if (pulse > ESC_PWM_MAX_PULSE_US)
+	{
+		pulse = ESC_PWM_MAX_PULSE_US;
+	}
+	return (uint16_t)pulse;
+}
+
+static uint16_t get_orin_servo_center_pulse(void)
+{
+	uint32_t pulse = g_orin_servo_center_us;
+	if (pulse < SERVO_MIN_PULSE_US)
+	{
+		pulse = SERVO_MIN_PULSE_US;
+	}
+	if (pulse > SERVO_MAX_PULSE_US)
+	{
+		pulse = SERVO_MAX_PULSE_US;
+	}
+	return (uint16_t)pulse;
+}
+
+static uint16_t get_orin_esc_forward_start_pulse(void)
+{
+	uint16_t center = get_orin_esc_center_pulse();
+	uint16_t pulse = clamp_esc_pulse((uint16_t)((g_orin_esc_forward_start_us == 0U) ?
+		ORIN_ESC_FORWARD_START_DEFAULT_US : g_orin_esc_forward_start_us));
+	return (pulse < center) ? center : pulse;
+}
+
+static uint16_t get_orin_esc_reverse_start_pulse(void)
+{
+	uint16_t center = get_orin_esc_center_pulse();
+	uint16_t pulse = clamp_esc_pulse((uint16_t)((g_orin_esc_reverse_start_us == 0U) ?
+		ORIN_ESC_REVERSE_START_DEFAULT_US : g_orin_esc_reverse_start_us));
+	return (pulse > center) ? center : pulse;
+}
+
+static uint16_t get_orin_esc_forward_limit_pulse(void)
+{
+	uint16_t start = get_orin_esc_forward_start_pulse();
+	uint16_t pulse = clamp_esc_pulse((uint16_t)((g_orin_esc_forward_max_us == 0U) ?
+		ORIN_ESC_FORWARD_MAX_DEFAULT_US : g_orin_esc_forward_max_us));
+	return (pulse < start) ? start : pulse;
+}
+
+static uint16_t get_orin_esc_reverse_limit_pulse(void)
+{
+	uint16_t start = get_orin_esc_reverse_start_pulse();
+	uint16_t pulse = clamp_esc_pulse((uint16_t)((g_orin_esc_reverse_max_us == 0U) ?
+		ORIN_ESC_REVERSE_MAX_DEFAULT_US : g_orin_esc_reverse_max_us));
+	return (pulse > start) ? start : pulse;
+}
+
+static float get_orin_velocity_neutral_threshold_mps(void)
+{
+	float deadband_mps = (float)get_orin_vx_deadband_mmps() / 1000.0f;
+	float min_vx_mps = (float)get_orin_ackermann_min_vx_mmps() / 1000.0f;
+	return (deadband_mps > min_vx_mps) ? deadband_mps : min_vx_mps;
+}
+
+static float scale_and_limit_orin_vx(float vx_mps)
+{
+	float scaled_vx = vx_mps * ((float)get_orin_vx_scale_permille() / 1000.0f);
+	const float forward_cap_mps = (float)get_orin_vx_forward_cap_mmps() / 1000.0f;
+	const float reverse_cap_mps = (float)get_orin_vx_reverse_cap_mmps() / 1000.0f;
+
+	if (scaled_vx > forward_cap_mps)
+	{
+		scaled_vx = forward_cap_mps;
+	}
+	else if (scaled_vx < -reverse_cap_mps)
+	{
+		scaled_vx = -reverse_cap_mps;
+	}
+
+	return scaled_vx;
+}
+
+static float clamp_legacy_orin_vz(float vz_rad_s)
+{
+	float max_rad_s = (float)((g_orin_vz_max_millirad == 0U) ? 1000U : g_orin_vz_max_millirad) / 1000.0f;
+
+	if (max_rad_s <= 0.001f)
+	{
+		return vz_rad_s;
+	}
+	if (vz_rad_s > max_rad_s)
+	{
+		return max_rad_s;
+	}
+	if (vz_rad_s < -max_rad_s)
+	{
+		return -max_rad_s;
+	}
+	return vz_rad_s;
+}
+
+static uint16_t limit_esc_safe_pulse(uint16_t pulse_us)
+{
+	uint16_t center;
+	uint16_t forward_limit;
+	uint16_t reverse_limit;
+
+	if (pulse_us == 0U)
+	{
+		return 0U;
+	}
+
+	pulse_us = clamp_esc_pulse(pulse_us);
+	center = get_orin_esc_center_pulse();
+	forward_limit = get_orin_esc_forward_limit_pulse();
+	reverse_limit = get_orin_esc_reverse_limit_pulse();
+
+	if (pulse_us >= center)
+	{
+		return (pulse_us > forward_limit) ? forward_limit : pulse_us;
+	}
+	return (pulse_us < reverse_limit) ? reverse_limit : pulse_us;
+}
+
+static uint16_t limit_servo_safe_pulse(uint16_t pulse_us)
+{
+	uint16_t center;
+	uint32_t range;
+	uint16_t low;
+	uint16_t high;
+
+	if (pulse_us == 0U)
+	{
+		return 0U;
+	}
+
+	pulse_us = clamp_servo_pulse(pulse_us);
+	center = get_orin_servo_center_pulse();
+	range = (g_orin_servo_range_us == 0U) ? 500U : g_orin_servo_range_us;
+	low = (center > range) ? (uint16_t)(center - range) : SERVO_MIN_PULSE_US;
+	high = (uint16_t)(center + range);
+	if (high > SERVO_MAX_PULSE_US)
+	{
+		high = SERVO_MAX_PULSE_US;
+	}
+
+	if (pulse_us < low)
+	{
+		return low;
+	}
+	if (pulse_us > high)
+	{
+		return high;
+	}
+	return pulse_us;
+}
+
+static uint8_t pulse_is_outside_center(uint16_t pulse_us, uint32_t center_us, uint32_t threshold_us)
+{
+	uint32_t diff;
+
+	if (pulse_us == 0U)
+	{
+		return 0U;
+	}
+
+	diff = (pulse_us > center_us) ? ((uint32_t)pulse_us - center_us) : (center_us - (uint32_t)pulse_us);
+	return (diff > threshold_us) ? 1U : 0U;
+}
+
+static uint8_t pulse_is_inside_center(uint16_t pulse_us, uint32_t center_us, uint32_t threshold_us)
+{
+	uint32_t diff;
+
+	if (pulse_us == 0U)
+	{
+		return 1U;
+	}
+
+	diff = (pulse_us > center_us) ? ((uint32_t)pulse_us - center_us) : (center_us - (uint32_t)pulse_us);
+	return (diff <= threshold_us) ? 1U : 0U;
+}
+
+static void refresh_rc_inputs(void)
+{
+	const uint32_t timeout_ms = get_rc_signal_timeout_ms();
+	const uint32_t now_ms = HAL_GetTick();
+	const uint16_t raw_throttle = ServoRC_GetThrottlePulse();
+	const uint16_t raw_steering = ServoRC_GetSteeringPulse();
+	const uint8_t raw_throttle_present = ServoRC_IsThrottleActive(timeout_ms);
+	const uint8_t raw_steering_present = ServoRC_IsSteeringActive(timeout_ms);
+	const uint8_t throttle_fault = ServoRC_HasThrottleFault();
+	const uint8_t steering_fault = ServoRC_HasSteeringFault();
+	const uint8_t guard_fault = ServoRC_HasGuardFault();
+
+	g_rc_guard_present = ServoRC_IsGuardActive(timeout_ms);
+
+	update_rc_channel_state(&g_rc_throttle_state, raw_throttle, raw_throttle_present, throttle_fault, now_ms, 1U);
+	update_rc_channel_state(&g_rc_steering_state, raw_steering, raw_steering_present, steering_fault, now_ms, 0U);
+
+	g_rc_throttle_present = g_rc_throttle_state.stable_present;
+	g_rc_steering_present = g_rc_steering_state.stable_present;
+	g_rc_throttle_current = g_rc_throttle_state.output_us;
+	g_rc_steering_current = g_rc_steering_state.output_us;
+	g_rc_throttle_last_good_us = (g_rc_throttle_state.last_good_us != 0U) ?
+		g_rc_throttle_state.last_good_us : ESC_PWM_NEUTRAL_PULSE_US;
+	g_rc_steering_last_good_us = (g_rc_steering_state.last_good_us != 0U) ?
+		g_rc_steering_state.last_good_us : ESC_PWM_NEUTRAL_PULSE_US;
+	g_rc_throttle_glitch_active = g_rc_throttle_state.glitch_active;
+	g_rc_steering_glitch_active = g_rc_steering_state.glitch_active;
+	g_rc_input_fault_active = (g_rc_throttle_state.invalid_since_ms != 0U ||
+		g_rc_steering_state.invalid_since_ms != 0U ||
+		throttle_fault != 0U ||
+		steering_fault != 0U ||
+		guard_fault != 0U) ? 1U : 0U;
+
+	g_rc_guard_current = (g_rc_guard_present != 0U) ? ServoRC_GetGuardPulse() : 0U;
+}
+
+static uint8_t rc_guard_input_is_active(void)
+{
+	if (g_rc_guard_enable == 0U || g_rc_guard_present == 0U || g_rc_guard_current == 0U)
+	{
+		return 0U;
+	}
+
+	if (g_rc_guard_active_high != 0U)
+	{
+		const uint32_t threshold = (g_rc_guard_active_high_threshold_us == 0U) ?
+			RC_GUARD_ACTIVE_HIGH_THRESHOLD_DEFAULT_US : g_rc_guard_active_high_threshold_us;
+		return (g_rc_guard_current >= threshold) ? 1U : 0U;
+	}
+
+	{
+		const uint32_t threshold = (g_rc_guard_active_low_threshold_us == 0U) ?
+			RC_GUARD_ACTIVE_LOW_THRESHOLD_DEFAULT_US : g_rc_guard_active_low_threshold_us;
+		return (g_rc_guard_current <= threshold) ? 1U : 0U;
+	}
+}
+
+static uint8_t rc_manual_override_requested(void)
+{
+	const uint32_t center_us = get_rc_override_center_us();
+	const uint32_t threshold_us = get_rc_override_enter_threshold_us();
+
+	if ((g_rc_throttle_present != 0U) &&
+		(pulse_is_outside_center(g_rc_throttle_current, center_us, threshold_us) != 0U))
+	{
+		return 1U;
+	}
+
+	if ((g_rc_steering_present != 0U) &&
+		(pulse_is_outside_center(g_rc_steering_current, center_us, threshold_us) != 0U))
+	{
+		return 1U;
+	}
+
+	return 0U;
+}
+
+static uint8_t rc_inputs_are_centered(void)
+{
+	const uint32_t center_us = get_rc_override_center_us();
+	const uint32_t threshold_us = get_rc_override_exit_threshold_us();
+	const uint8_t throttle_centered = (g_rc_throttle_present == 0U) ? 1U :
+		pulse_is_inside_center(g_rc_throttle_current, center_us, threshold_us);
+	const uint8_t steering_centered = (g_rc_steering_present == 0U) ? 1U :
+		pulse_is_inside_center(g_rc_steering_current, center_us, threshold_us);
+
+	return (throttle_centered != 0U && steering_centered != 0U) ? 1U : 0U;
+}
+
+static uint8_t rc_passthrough_is_available(void)
+{
+	return (g_rc_throttle_present != 0U && g_rc_steering_present != 0U) ? 1U : 0U;
+}
+
+static void set_rc_override_state(uint8_t override_active, uint8_t guard_active)
+{
+	g_rc_override_active = (override_active != 0U) ? 1U : 0U;
+	g_rc_guard_active = (guard_active != 0U) ? 1U : 0U;
+	g_state.control_mode = (g_rc_override_active != 0U) ? SERVO_CTRL_MODE_RC_PASSTHROUGH :
+		SERVO_CTRL_MODE_AUTONOMOUS;
+	g_state.rc_takeover_pending = 0U;
+	g_state.emergency_stop = g_rc_guard_active;
+	g_rc_override_release_start_ms = 0U;
+	g_rc_override_enter_count = 0U;
+
+}
+
+static void apply_esc_pulse(uint16_t pulse_us)
+{
+	g_state.esc_pulse_us = pulse_us;
+	ServoBasic_OutputEscPulse(pulse_us);
+}
+
+static void apply_servo_pulse(uint16_t pulse_us)
+{
+	g_state.servo_pulse_us = pulse_us;
+	ServoBasic_OutputServoPulse(pulse_us);
+}
+
+static void set_esc_target(uint16_t pulse_us)
+{
+	g_state.esc_pulse_us = pulse_us;
+	g_autonomous_target_valid = 1U;
+}
+
+static void set_servo_target(uint16_t pulse_us)
+{
+	g_state.servo_pulse_us = pulse_us;
+	g_autonomous_target_valid = 1U;
+}
+
+void ServoBasic_Init(void)
+{
+	g_state.control_mode = SERVO_CTRL_MODE_AUTONOMOUS;
+	g_state.rc_takeover_pending = 0U;
+	g_state.emergency_stop = 0U;
+	g_rc_override_active = 0U;
+	g_rc_guard_active = 0U;
+	g_rc_override_enter_count = 0U;
+	g_rc_override_release_start_ms = 0U;
+	g_rc_throttle_present = 0U;
+	g_rc_steering_present = 0U;
+	g_rc_guard_present = 0U;
+	g_autonomous_target_valid = 0U;
+	rc_debounce_reset();
+	g_orin_state.esc_pulse_us = ESC_PWM_NEUTRAL_PULSE_US;
+	g_orin_state.servo_pulse_us = ESC_PWM_NEUTRAL_PULSE_US;
+	g_orin_state.last_update_ms = 0U;
+	g_orin_state.feedback_vx_mps = 0.0f;
+	g_orin_state.feedback_vy_mps = 0.0f;
+	g_orin_state.feedback_vz_rad_s = 0.0f;
+	g_orin_state.active = 0U;
+	g_orin_state.stop = 0U;
+	ServoRC_Capture_Init();
+	apply_esc_pulse(get_orin_esc_center_pulse());
+	apply_servo_pulse(get_orin_servo_center_pulse());
+}
+
+static uint16_t orin_map_vx_to_esc(float vx_mps)
+{
+	float scaled_vx_mps = scale_and_limit_orin_vx(vx_mps);
+	float magnitude_mps;
+	float cap_mps;
+	float deadband_mps = (float)get_orin_vx_deadband_mmps() / 1000.0f;
+	float ratio;
+	float pulse;
+
+	if (fabsf(scaled_vx_mps) <= deadband_mps)
+	{
+		return get_orin_esc_center_pulse();
+	}
+
+	if (scaled_vx_mps > 0.0f)
+	{
+		magnitude_mps = scaled_vx_mps;
+		cap_mps = (float)get_orin_vx_forward_cap_mmps() / 1000.0f;
+		ratio = (cap_mps <= deadband_mps) ? 1.0f : (magnitude_mps - deadband_mps) / (cap_mps - deadband_mps);
+		if (ratio > 1.0f)
+		{
+			ratio = 1.0f;
+		}
+		pulse = (float)get_orin_esc_forward_start_pulse() +
+			ratio * (float)(get_orin_esc_forward_limit_pulse() - get_orin_esc_forward_start_pulse());
+	}
+	else
+	{
+		magnitude_mps = -scaled_vx_mps;
+		cap_mps = (float)get_orin_vx_reverse_cap_mmps() / 1000.0f;
+		ratio = (cap_mps <= deadband_mps) ? 1.0f : (magnitude_mps - deadband_mps) / (cap_mps - deadband_mps);
+		if (ratio > 1.0f)
+		{
+			ratio = 1.0f;
+		}
+		pulse = (float)get_orin_esc_reverse_start_pulse() +
+			ratio * (float)((int32_t)get_orin_esc_reverse_limit_pulse() - (int32_t)get_orin_esc_reverse_start_pulse());
+	}
+
+	return limit_esc_safe_pulse((uint16_t)pulse);
+}
+
+static uint16_t orin_map_vz_to_servo(float vx_mps, float vz_rad_s)
+{
+	float scaled_vx_mps = scale_and_limit_orin_vx(vx_mps);
+	float abs_vx_mps = fabsf(scaled_vx_mps);
+	float min_vx_mps = (float)get_orin_ackermann_min_vx_mmps() / 1000.0f;
+	float max_steering_rad;
+	float wheelbase_m;
+	float delta_rad;
+	float ratio;
+	float limited_vz_rad_s;
+
+	if (abs_vx_mps < min_vx_mps)
+	{
+		return get_orin_servo_center_pulse();
+	}
+
+	max_steering_rad = (float)get_orin_ackermann_max_steering_millirad() / 1000.0f;
+	wheelbase_m = (float)get_orin_ackermann_wheelbase_mm() / 1000.0f;
+	limited_vz_rad_s = clamp_legacy_orin_vz(vz_rad_s);
+	delta_rad = atanf((wheelbase_m * limited_vz_rad_s) / scaled_vx_mps);
+
+	if (max_steering_rad <= 0.001f)
+	{
+		return get_orin_servo_center_pulse();
+	}
+
+	if (delta_rad > max_steering_rad)
+	{
+		delta_rad = max_steering_rad;
+	}
+	else if (delta_rad < -max_steering_rad)
+	{
+		delta_rad = -max_steering_rad;
+	}
+
+	ratio = delta_rad / max_steering_rad;
+	return limit_servo_safe_pulse((uint16_t)((int32_t)get_orin_servo_center_pulse() +
+		(int32_t)(ratio * (float)((g_orin_servo_range_us == 0U) ? 500U : g_orin_servo_range_us))));
+}
+
+static float telemetry_estimate_vx_from_esc_pulse(uint16_t pulse_us)
+{
+	const float deadband_mps = (float)get_orin_vx_deadband_mmps() / 1000.0f;
+	const float forward_cap_mps = (float)get_orin_vx_forward_cap_mmps() / 1000.0f;
+	const float reverse_cap_mps = (float)get_orin_vx_reverse_cap_mmps() / 1000.0f;
+	const uint16_t center_pulse = get_orin_esc_center_pulse();
+	const uint16_t forward_start = get_orin_esc_forward_start_pulse();
+	const uint16_t reverse_start = get_orin_esc_reverse_start_pulse();
+	const uint16_t forward_limit = get_orin_esc_forward_limit_pulse();
+	const uint16_t reverse_limit = get_orin_esc_reverse_limit_pulse();
+	float ratio;
+
+	if (pulse_us == 0U || pulse_us == center_pulse)
+	{
+		return 0.0f;
+	}
+
+	if (pulse_us > center_pulse)
+	{
+		if (pulse_us <= forward_start)
+		{
+			return 0.0f;
+		}
+		if (forward_limit <= forward_start)
+		{
+			return forward_cap_mps;
+		}
+		ratio = (float)((int32_t)pulse_us - (int32_t)forward_start) /
+			(float)((int32_t)forward_limit - (int32_t)forward_start);
+		if (ratio < 0.0f)
+		{
+			ratio = 0.0f;
+		}
+		else if (ratio > 1.0f)
+		{
+			ratio = 1.0f;
+		}
+		return deadband_mps + ratio * (forward_cap_mps - deadband_mps);
+	}
+
+	if (pulse_us >= reverse_start)
+	{
+		return 0.0f;
+	}
+	if (reverse_start <= reverse_limit)
+	{
+		return -reverse_cap_mps;
+	}
+	ratio = (float)((int32_t)reverse_start - (int32_t)pulse_us) /
+		(float)((int32_t)reverse_start - (int32_t)reverse_limit);
+	if (ratio < 0.0f)
+	{
+		ratio = 0.0f;
+	}
+	else if (ratio > 1.0f)
+	{
+		ratio = 1.0f;
+	}
+	return -(deadband_mps + ratio * (reverse_cap_mps - deadband_mps));
+}
+
+static float telemetry_estimate_steering_rad_from_servo_pulse(uint16_t pulse_us)
+{
+	const uint16_t center_pulse = get_orin_servo_center_pulse();
+	const uint16_t pulse_range = (g_orin_servo_range_us == 0U) ? 500U : (uint16_t)g_orin_servo_range_us;
+	const float max_steering_rad = (float)get_orin_ackermann_max_steering_millirad() / 1000.0f;
+	float ratio;
+
+	if (pulse_us == 0U || pulse_range == 0U || max_steering_rad <= 0.001f)
+	{
+		return 0.0f;
+	}
+
+	ratio = (float)((int32_t)pulse_us - (int32_t)center_pulse) / (float)pulse_range;
+	if (ratio > 1.0f)
+	{
+		ratio = 1.0f;
+	}
+	else if (ratio < -1.0f)
+	{
+		ratio = -1.0f;
+	}
+	return ratio * max_steering_rad;
+}
+
+static float telemetry_estimate_vz_from_pwm(float vx_mps, uint16_t servo_pulse_us)
+{
+	const float min_vx_mps = (float)get_orin_ackermann_min_vx_mmps() / 1000.0f;
+	const float wheelbase_m = (float)get_orin_ackermann_wheelbase_mm() / 1000.0f;
+	const float steering_rad = telemetry_estimate_steering_rad_from_servo_pulse(servo_pulse_us);
+
+	if (fabsf(vx_mps) < min_vx_mps || fabsf(steering_rad) < 0.001f || wheelbase_m <= 0.001f)
+	{
+		return 0.0f;
+	}
+
+	return tanf(steering_rad) * vx_mps / wheelbase_m;
+}
+
+static uint8_t telemetry_pwm_feedback_is_valid(void)
+{
+	const uint32_t esc_delta = pulse_diff(g_state.esc_pulse_us, get_orin_esc_center_pulse());
+	const uint32_t servo_delta = pulse_diff(g_state.servo_pulse_us, get_orin_servo_center_pulse());
+
+	if (g_state.emergency_stop != 0U)
+	{
+		return 0U;
+	}
+
+	if (esc_delta > 5U || servo_delta > 5U)
+	{
+		return 1U;
+	}
+
+	if (g_state.control_mode == SERVO_CTRL_MODE_RC_PASSTHROUGH)
+	{
+		return (g_rc_throttle_present != 0U || g_rc_steering_present != 0U) ? 1U : 0U;
+	}
+
+	if (g_orin_state.active != 0U)
+	{
+		return 1U;
+	}
+
+	if (g_autonomous_target_valid != 0U)
+	{
+		return 1U;
+	}
+
+	return 0U;
+}
+
+void ServoBasic_UpdateFromOrin(float vx_mps, float vy_mps, float vz_rad_s, uint8_t flag_stop)
+{
+	float scaled_vx_mps;
+	float limited_vz_rad_s = clamp_legacy_orin_vz(vz_rad_s);
+
+	(void)vy_mps;
+	(void)get_orin_ackermann_track_width_mm();
+	(void)get_orin_ackermann_wheel_radius_mm();
+	if (g_orin_pwm_enable == 0U)
+	{
+		return;
+	}
+
+	scaled_vx_mps = scale_and_limit_orin_vx(vx_mps);
+	if (fabsf(scaled_vx_mps) < get_orin_velocity_neutral_threshold_mps())
+	{
+		g_orin_state.esc_pulse_us = get_orin_esc_center_pulse();
+		g_orin_state.servo_pulse_us = get_orin_servo_center_pulse();
+		g_orin_state.feedback_vx_mps = 0.0f;
+		g_orin_state.feedback_vy_mps = 0.0f;
+		g_orin_state.feedback_vz_rad_s = 0.0f;
+	}
+	else
+	{
+		g_orin_state.esc_pulse_us = orin_map_vx_to_esc(vx_mps);
+		g_orin_state.servo_pulse_us = orin_map_vz_to_servo(vx_mps, vz_rad_s);
+		g_orin_state.feedback_vx_mps = scaled_vx_mps;
+		g_orin_state.feedback_vy_mps = 0.0f;
+		g_orin_state.feedback_vz_rad_s = limited_vz_rad_s;
+	}
+
+	if (flag_stop != 0U)
+	{
+		g_orin_state.feedback_vx_mps = 0.0f;
+		g_orin_state.feedback_vy_mps = 0.0f;
+		g_orin_state.feedback_vz_rad_s = 0.0f;
+	}
+
+	g_orin_state.last_update_ms = HAL_GetTick();
+	g_orin_state.active = 1U;
+	g_orin_state.stop = (flag_stop != 0U) ? 1U : 0U;
+}
+
+static uint8_t orin_pwm_is_active(void)
+{
+	if (g_orin_pwm_enable == 0U || g_orin_state.active == 0U)
+	{
+		return 0U;
+	}
+	const uint32_t timeout_ms = (g_orin_pwm_timeout_ms == 0U) ? 200U : g_orin_pwm_timeout_ms;
+	return (HAL_GetTick() - g_orin_state.last_update_ms) <= timeout_ms;
+}
+
+static void update_control_mode_from_rc(void)
+{
+	const uint8_t guard_active = rc_guard_input_is_active();
+	const uint8_t manual_override = rc_manual_override_requested();
+	const uint8_t centered = rc_inputs_are_centered();
+	const uint8_t serial_active = orin_pwm_is_active();
+	const uint8_t rc_available = rc_passthrough_is_available();
+
+	if (guard_active != 0U)
+	{
+		if (g_rc_override_active == 0U || g_rc_guard_active == 0U)
+		{
+			set_rc_override_state(1U, 1U);
+		}
+		return;
+	}
+
+	/*
+	 * Keep ordinary RC behavior unchanged when there is no active serial PWM source:
+	 * with a valid receiver connected, RC should directly drive ESC/servo without
+	 * requiring a large stick delta just to "take over" an idle autonomous path.
+	 *
+	 * The enter-threshold / sample-count gate is only used while a serial command
+	 * stream is actively driving the PWM path.
+	 */
+	if (serial_active == 0U)
+	{
+		if (rc_available != 0U)
+		{
+			if (g_rc_override_active == 0U || g_rc_guard_active != 0U)
+			{
+				set_rc_override_state(1U, 0U);
+			}
+		}
+		else if (g_rc_override_active != 0U)
+		{
+			set_rc_override_state(0U, 0U);
+		}
+		else
+		{
+			g_state.control_mode = SERVO_CTRL_MODE_AUTONOMOUS;
+			g_state.emergency_stop = 0U;
+		}
+		return;
+	}
+
+	/*
+	 * When serial becomes active and the receiver sticks are already centered,
+	 * release the "idle RC passthrough" state immediately so serial control can
+	 * take effect. From this point on, RC must exceed the configured threshold to
+	 * reclaim control.
+	 */
+	if (g_rc_override_active != 0U && g_rc_guard_active == 0U && centered != 0U)
+	{
+		set_rc_override_state(0U, 0U);
+	}
+
+	if (g_rc_override_active == 0U)
+	{
+		if (manual_override != 0U)
+		{
+			const uint32_t samples_req = get_rc_override_enter_samples();
+			if (g_rc_override_enter_count < samples_req)
+			{
+				g_rc_override_enter_count++;
+			}
+			if (g_rc_override_enter_count >= samples_req)
+			{
+				set_rc_override_state(1U, 0U);
+			}
+		}
+		else
+		{
+			g_rc_override_enter_count = 0U;
+			g_state.control_mode = SERVO_CTRL_MODE_AUTONOMOUS;
+			g_state.emergency_stop = 0U;
+		}
+		return;
+	}
+
+	if (g_rc_guard_active != 0U)
+	{
+		set_rc_override_state(1U, 0U);
+	}
+
+	if (manual_override != 0U)
+	{
+		g_rc_override_release_start_ms = 0U;
+		return;
+	}
+
+	if (centered == 0U)
+	{
+		g_rc_override_release_start_ms = 0U;
+		return;
+	}
+
+	if (g_rc_override_release_start_ms == 0U)
+	{
+		g_rc_override_release_start_ms = HAL_GetTick();
+		return;
+	}
+
+	if ((HAL_GetTick() - g_rc_override_release_start_ms) >= get_rc_override_release_hold_ms())
+	{
+		set_rc_override_state(0U, 0U);
+	}
+}
+
+static void apply_rc_passthrough_outputs(void)
+{
+	if (g_rc_throttle_present == 0U || g_rc_steering_present == 0U)
+	{
+		apply_esc_pulse(get_orin_esc_center_pulse());
+		apply_servo_pulse(get_orin_servo_center_pulse());
+		return;
+	}
+
+	apply_esc_pulse(rc_select_pulse(g_rc_throttle_current, 1U));
+	apply_servo_pulse(rc_select_pulse(g_rc_steering_current, 0U));
+}
+
+static void apply_autonomous_outputs(void)
+{
+	apply_esc_pulse(limit_esc_safe_pulse(clamp_esc_pulse(g_state.esc_pulse_us)));
+	apply_servo_pulse(limit_servo_safe_pulse(clamp_servo_pulse(g_state.servo_pulse_us)));
+}
+
+void ServoBasic_ProcessControl(void)
+{
+	uint8_t orin_active;
+
+	refresh_rc_inputs();
+	update_control_mode_from_rc();
+	orin_active = orin_pwm_is_active();
+
+	if (g_state.emergency_stop != 0U)
+	{
+		apply_esc_pulse(ESC_PWM_MIN_PULSE_US);
+		apply_servo_pulse(get_orin_servo_center_pulse());
+		return;
+	}
+	if (g_rc_override_active != 0U)
+	{
+		apply_rc_passthrough_outputs();
+	}
+	else if (orin_active != 0U)
+	{
+		if (g_orin_state.stop != 0U)
+		{
+			apply_esc_pulse(0U);
+			apply_servo_pulse(0U);
+		}
+		else
+		{
+			apply_esc_pulse(limit_esc_safe_pulse(clamp_esc_pulse(g_orin_state.esc_pulse_us)));
+			apply_servo_pulse(limit_servo_safe_pulse(clamp_servo_pulse(g_orin_state.servo_pulse_us)));
+		}
+	}
+	else
+	{
+		if (g_autonomous_target_valid != 0U)
+		{
+			apply_autonomous_outputs();
+		}
+		else
+		{
+			apply_esc_pulse(get_orin_esc_center_pulse());
+			apply_servo_pulse(get_orin_servo_center_pulse());
+		}
+	}
+}
+
+void ServoBasic_TaskInit(void)
+{
+	if (g_servo_basic_queue == NULL)
+	{
+		g_servo_basic_queue = xQueueCreate(8U, sizeof(servo_basic_msg_t));
+	}
+}
+
+BaseType_t ServoBasic_EnqueueCanMessageFromISR(uint32_t can_id,
+											   const uint8_t *payload,
+											   uint8_t payload_len,
+											   BaseType_t *pxHigherPriorityTaskWoken)
+{
+	if (g_servo_basic_queue == NULL || payload == NULL)
+	{
+		return pdFAIL;
+	}
+
+	servo_basic_msg_t msg;
+	msg.can_id = can_id;
+	msg.payload_len = (payload_len > 8U) ? 8U : payload_len;
+	memcpy(msg.payload, payload, msg.payload_len);
+
+	return xQueueSendFromISR(g_servo_basic_queue, &msg, pxHigherPriorityTaskWoken);
+}
+
+void ServoBasic_Task(void *param)
+{
+	(void)param;
+
+	servo_basic_msg_t msg;
+	TickType_t last_wake = xTaskGetTickCount();
+	const TickType_t period_ticks = pdMS_TO_TICKS(20U);
+	for (;;)
+	{
+		if (g_debug_servo_trigger != 0U)
+		{
+			uint8_t payload[3];
+			uint8_t payload_len = 2U;
+			const uint32_t cmd = g_debug_servo_cmd;
+			const uint32_t value = g_debug_servo_value;
+			const uint32_t can_id = g_debug_servo_can_id;
+
+			g_debug_servo_trigger = 0U;
+
+			payload[0] = (uint8_t)cmd;
+			payload[1] = (uint8_t)value;
+			if (cmd == SERVO_CMD_SET_ESC_PULSE)
+			{
+				payload_len = 3U;
+				payload[2] = (uint8_t)(value >> 8);
+			}
+
+			ServoBasic_HandleCanMessage(can_id, 1U, payload, payload_len);
+		}
+
+		while (xQueueReceive(g_servo_basic_queue, &msg, 0U) == pdPASS)
+		{
+			ServoBasic_HandleCanMessage(msg.can_id, 1U, msg.payload, msg.payload_len);
+		}
+
+		ServoBasic_ProcessControl();
+		vTaskDelayUntil(&last_wake, period_ticks);
+	}
+}
+
+static uint8_t is_valid_can_id(uint32_t can_id)
+{
+	return (can_id == SERVO_CAN_ID_0) || (can_id == SERVO_CAN_ID_1);
+}
+
+void ServoBasic_HandleCanMessage(uint32_t can_id,
+								 uint8_t is_extended_id,
+								 const uint8_t *payload,
+								 uint8_t payload_len)
+{
+	if (!is_extended_id || !is_valid_can_id(can_id) || payload == NULL || payload_len == 0U) // BP: ServoBasic_HandleCanMessage entry guard
+	{
+		return;
+	}
+
+	if (payload_len > 8U)
+	{
+		payload_len = 8U;
+	}
+
+	switch (payload[0])
+	{
+	case SERVO_CMD_SET_SERVO_ANGLE:
+		if (payload_len >= 2U)
+		{
+			const uint16_t angle = clamp_servo_angle(payload[1]);
+			const uint16_t pulse = servo_angle_to_pulse(angle);
+			set_servo_target(pulse); // BP: apply servo angle -> pulse
+			SERVO_BASIC_LOG("servo angle=%u, pulse=%u\n", (unsigned int)angle, (unsigned int)pulse);
+		}
+		break;
+
+	case SERVO_CMD_SET_SERVO_PULSE:
+		if (payload_len >= 2U)
+		{
+			const uint8_t step = clamp_servo_step(payload[1]);
+			const uint16_t pulse = servo_step_to_pulse(step);
+			set_servo_target(pulse); // BP: apply servo step -> pulse
+			SERVO_BASIC_LOG("servo step=%u, pulse=%u\n", (unsigned int)step, (unsigned int)pulse);
+		}
+		break;
+
+	case SERVO_CMD_SET_ESC_PULSE:
+		if (payload_len >= 3U)
+		{
+			const uint16_t raw = (uint16_t)payload[1] | ((uint16_t)payload[2] << 8);
+			const uint16_t pulse = clamp_esc_pulse(raw);
+			set_esc_target(pulse); // BP: apply esc pulse
+			SERVO_BASIC_LOG("esc pulse=%u\n", (unsigned int)pulse);
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+const servo_basic_state_t *ServoBasic_GetState(void)
+{
+	return &g_state;
+}
+
+uint8_t ServoBasic_IsRcOverrideActive(void)
+{
+	return g_rc_override_active;
+}
+
+uint8_t ServoBasic_IsRcEmergencyActive(void)
+{
+	return g_rc_guard_active;
+}
+
+uint8_t ServoBasic_GetOrinFeedback(float *vx_mps, float *vy_mps, float *vz_rad_s)
+{
+	float feedback_vx = 0.0f;
+	float feedback_vz = 0.0f;
+	const uint8_t command_feedback_active = (g_orin_state.stop == 0U && orin_pwm_is_active() != 0U) ? 1U : 0U;
+
+	if (command_feedback_active != 0U &&
+		(fabsf(g_orin_state.feedback_vx_mps) >= 0.001f || fabsf(g_orin_state.feedback_vz_rad_s) >= 0.001f))
+	{
+		feedback_vx = g_orin_state.feedback_vx_mps;
+		feedback_vz = g_orin_state.feedback_vz_rad_s;
+	}
+	else
+	{
+		if (telemetry_pwm_feedback_is_valid() == 0U)
+		{
+			return 0U;
+		}
+
+		feedback_vx = telemetry_estimate_vx_from_esc_pulse(g_state.esc_pulse_us);
+		feedback_vz = telemetry_estimate_vz_from_pwm(feedback_vx, g_state.servo_pulse_us);
+
+		if (fabsf(feedback_vx) < 0.001f && fabsf(feedback_vz) < 0.001f && command_feedback_active != 0U)
+		{
+			feedback_vx = g_orin_state.feedback_vx_mps;
+			feedback_vz = g_orin_state.feedback_vz_rad_s;
+		}
+	}
+
+	if (vx_mps != NULL)
+	{
+		*vx_mps = feedback_vx;
+	}
+	if (vy_mps != NULL)
+	{
+		*vy_mps = 0.0f;
+	}
+	if (vz_rad_s != NULL)
+	{
+		*vz_rad_s = feedback_vz;
+	}
+
+	return 1U;
+}
