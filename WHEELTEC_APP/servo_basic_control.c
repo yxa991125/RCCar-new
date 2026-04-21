@@ -8,6 +8,7 @@
 #include <math.h>
 #include "FreeRTOS.h"
 #include "task.h"
+#include "hall_speed.h"
 #include "servo_rc_capture.h"
 
 #ifndef SERVO_BASIC_LOG
@@ -530,16 +531,6 @@ static uint32_t get_orin_vx_scale_permille(void)
 	return (g_orin_vx_scale == 0U) ? ORIN_VX_SCALE_DEFAULT_PERMILLE : g_orin_vx_scale;
 }
 
-static uint32_t get_orin_feedback_scale_permille(void)
-{
-	return (g_orin_feedback_scale == 0U) ? ORIN_FEEDBACK_SCALE_DEFAULT_PERMILLE : g_orin_feedback_scale;
-}
-
-static float scale_telemetry_feedback(float value)
-{
-	return value * ((float)get_orin_feedback_scale_permille() / 1000.0f);
-}
-
 static uint32_t get_orin_vx_forward_cap_mmps(void)
 {
 	if (g_orin_vx_forward_cap_mmps != 0U)
@@ -989,67 +980,6 @@ static uint16_t orin_map_vz_to_servo(float vx_mps, float vz_rad_s)
 		(int32_t)(ratio * (float)((g_orin_servo_range_us == 0U) ? 500U : g_orin_servo_range_us))));
 }
 
-static float telemetry_estimate_vx_from_esc_pulse(uint16_t pulse_us)
-{
-	const float deadband_mps = (float)get_orin_vx_deadband_mmps() / 1000.0f;
-	const float forward_cap_mps = (float)get_orin_vx_forward_cap_mmps() / 1000.0f;
-	const float reverse_cap_mps = (float)get_orin_vx_reverse_cap_mmps() / 1000.0f;
-	const uint16_t center_pulse = get_orin_esc_center_pulse();
-	const uint16_t forward_start = get_orin_esc_forward_start_pulse();
-	const uint16_t reverse_start = get_orin_esc_reverse_start_pulse();
-	const uint16_t forward_limit = get_orin_esc_forward_limit_pulse();
-	const uint16_t reverse_limit = get_orin_esc_reverse_limit_pulse();
-	float ratio;
-
-	if (pulse_us == 0U || pulse_us == center_pulse)
-	{
-		return 0.0f;
-	}
-
-	if (pulse_us > center_pulse)
-	{
-		if (pulse_us <= forward_start)
-		{
-			return 0.0f;
-		}
-		if (forward_limit <= forward_start)
-		{
-			return forward_cap_mps;
-		}
-		ratio = (float)((int32_t)pulse_us - (int32_t)forward_start) /
-			(float)((int32_t)forward_limit - (int32_t)forward_start);
-		if (ratio < 0.0f)
-		{
-			ratio = 0.0f;
-		}
-		else if (ratio > 1.0f)
-		{
-			ratio = 1.0f;
-		}
-		return deadband_mps + ratio * (forward_cap_mps - deadband_mps);
-	}
-
-	if (pulse_us >= reverse_start)
-	{
-		return 0.0f;
-	}
-	if (reverse_start <= reverse_limit)
-	{
-		return -reverse_cap_mps;
-	}
-	ratio = (float)((int32_t)reverse_start - (int32_t)pulse_us) /
-		(float)((int32_t)reverse_start - (int32_t)reverse_limit);
-	if (ratio < 0.0f)
-	{
-		ratio = 0.0f;
-	}
-	else if (ratio > 1.0f)
-	{
-		ratio = 1.0f;
-	}
-	return -(deadband_mps + ratio * (reverse_cap_mps - deadband_mps));
-}
-
 static float telemetry_estimate_steering_rad_from_servo_pulse(uint16_t pulse_us)
 {
 	const uint16_t center_pulse = get_orin_servo_center_pulse();
@@ -1086,39 +1016,6 @@ static float telemetry_estimate_vz_from_pwm(float vx_mps, uint16_t servo_pulse_u
 	}
 
 	return tanf(steering_rad) * vx_mps / wheelbase_m;
-}
-
-static uint8_t telemetry_pwm_feedback_is_valid(void)
-{
-	const uint32_t esc_delta = pulse_diff(g_state.esc_pulse_us, get_orin_esc_center_pulse());
-	const uint32_t servo_delta = pulse_diff(g_state.servo_pulse_us, get_orin_servo_center_pulse());
-
-	if (g_state.emergency_stop != 0U)
-	{
-		return 0U;
-	}
-
-	if (esc_delta > 5U || servo_delta > 5U)
-	{
-		return 1U;
-	}
-
-	if (g_state.control_mode == SERVO_CTRL_MODE_RC_PASSTHROUGH)
-	{
-		return (g_rc_throttle_present != 0U || g_rc_steering_present != 0U) ? 1U : 0U;
-	}
-
-	if (g_orin_state.active != 0U)
-	{
-		return 1U;
-	}
-
-	if (g_autonomous_target_valid != 0U)
-	{
-		return 1U;
-	}
-
-	return 0U;
 }
 
 void ServoBasic_UpdateFromOrin(float vx_mps, float vy_mps, float vz_rad_s, uint8_t flag_stop)
@@ -1423,13 +1320,11 @@ uint8_t ServoBasic_GetOrinFeedback(float *vx_mps, float *vy_mps, float *vz_rad_s
 	float feedback_vx = 0.0f;
 	float feedback_vz = 0.0f;
 
-	if (telemetry_pwm_feedback_is_valid() == 0U)
+	if (HallSpeed_GetSignedSpeedMps(&feedback_vx) == 0U)
 	{
 		return 0U;
 	}
 
-	feedback_vx = telemetry_estimate_vx_from_esc_pulse(g_state.esc_pulse_us);
-	feedback_vx = scale_telemetry_feedback(feedback_vx);
 	feedback_vz = telemetry_estimate_vz_from_pwm(feedback_vx, g_state.servo_pulse_us);
 
 	if (vx_mps != NULL)

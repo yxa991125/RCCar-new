@@ -38,6 +38,7 @@
 #include "bsp_adc.h"
 #include "bsp_flash.h"
 
+#include "hall_speed.h"
 #include "servo_basic_control.h"
 #include "robot_select_init.h"
 
@@ -134,11 +135,14 @@ int main(void)
   /* Initialize Ackermann servo/ESC control state */
   ServoBasic_Init();
 	
-	//DWT瀹氭椂鍣ㄥ垵濮嬪寲,鐢ㄤ簬瀹炵幇ms銆乽s寤舵椂鍑芥暟
-	DWT_Init();
+		//DWT瀹氭椂鍣ㄥ垵濮嬪寲,鐢ㄤ簬瀹炵幇ms銆乽s寤舵椂鍑芥暟
+		DWT_Init();
 
-	//ADC鐢ㄦ埛閰嶇疆鍒濆鍖?
-	ADC_Userconfig_Init();
+		//鍒濆鍖栭湇灏旇疆閫熺姸鎬侊紝璇ュ姛鑳藉湪 PE9/PE11 EXTI 杈撳叆涓婂伐浣?
+		HallSpeed_Init();
+
+		//ADC鐢ㄦ埛閰嶇疆鍒濆鍖?
+		ADC_Userconfig_Init();
 	
 	//鍚姩FreeRTOS绯荤粺璋冭瘯瀹氭椂鍣?
 	HAL_TIM_Base_Start(&htim6);
@@ -393,5 +397,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
 

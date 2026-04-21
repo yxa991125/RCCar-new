@@ -32,6 +32,27 @@
   - `PC7 -> TIM8_CH2`：Servo PWM
 - `PC8/PC9` 当前不作为正式控制输出使用。
 
+### 4. 霍尔轮速反馈（阶段一）
+- 当前阶段新增双路霍尔轮速输入，仅用于替换 `ROS` 上行 `vx` 伪反馈，不参与 `ESC` 闭环控制。
+- 接线规划：
+  - `PE9`：`Hall A`
+  - `PE11`：`Hall B`
+- 计数方式固定为：
+  - 仅在 `Hall A` 的下降沿记录一次有效事件
+  - 在该时刻读取 `Hall B` 电平判定方向
+  - 当前默认 `HALL_COUNT_EVENTS_PER_REV = 1`
+  - 后续若改成两个检测点，只修改 `HALL_COUNT_EVENTS_PER_REV = 2`
+- 当前轮径按 `0.235 m` 计算，轮周长约 `0.738 m`
+- 当前阶段不启用 `PID`，只做真实测速与反馈替换
+
+#### 霍尔输入电气前提
+- 双路霍尔信号均按 `3.3V` 上拉、低电平有效处理
+- 霍尔传感器与主控必须共地
+- `PE9/PE11` 输入电平不得超过 `3.3V`
+- 若实测高电平可能高于 `3.3V`，必须先做电平转换或隔离
+- `PA13/PA14` 为 `SWD` 下载调试口，不能占用
+- `PC6/PC7` 已为正式 `ESC/Servo PWM` 输出，不能改作轮速输入
+
 ## Ackermann 几何参数
 当前几何参数以 `EXTRINSICS.md` 为准：
 - `wheelbase = 0.54 m`
@@ -71,7 +92,8 @@
 
 说明：
 - `vx/vy/wz` 由 `ServoBasic_GetOrinFeedback()` 提供
-- 当前默认会再乘一个独立的反馈修正系数 `g_orin_feedback_scale`
+- 阶段一启用霍尔轮速后，`vx` 优先使用真实轮速反馈
+- `g_orin_feedback_scale` 只保留给旧的 PWM 估算反馈，不再作用于霍尔真轮速
 - 默认值为 `1254`（按千分比），即 `1.254x`
 - `battery` 单位为 mV
 - `UART4 -> ROS` 只发送这 24 字节基础帧
@@ -110,6 +132,10 @@
 - `g_state.control_mode`
 - `g_state.esc_pulse_us`
 - `g_state.servo_pulse_us`
+- `g_hall_speed_state.event_count_total`
+- `g_hall_speed_state.last_period_us`
+- `g_hall_speed_state.direction`
+- `g_hall_speed_state.fault_count`
 - `g_rc_override_active`
 - `g_rc_guard_active`
 - `g_orin_state.active`

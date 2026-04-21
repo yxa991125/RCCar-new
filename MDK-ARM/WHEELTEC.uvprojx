@@ -1579,6 +1579,11 @@
               <FileType>1</FileType>
               <FilePath>..\WHEELTEC_APP\servo_rc_capture.c</FilePath>
             </File>
+            <File>
+              <FileName>hall_speed.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\WHEELTEC_APP\hall_speed.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

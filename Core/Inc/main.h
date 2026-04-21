@@ -131,6 +131,10 @@ void Error_Handler(void);
 #define LED_G_GPIO_Port GPIOB
 #define ENKey_Pin GPIO_PIN_0
 #define ENKey_GPIO_Port GPIOE
+#define HallA_Pin GPIO_PIN_9
+#define HallA_GPIO_Port GPIOE
+#define HallB_Pin GPIO_PIN_11
+#define HallB_GPIO_Port GPIOE
 
 /* USER CODE BEGIN Private defines */
 //全局调试使用
