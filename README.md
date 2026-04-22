@@ -38,11 +38,10 @@
   - `PE9`：`Hall A`
   - `PE11`：`Hall B`
 - 计数方式固定为：
-  - 当前验证方案暂改为在 `Hall B` 的上升沿和下降沿都记录有效事件
+  - 保留当前 `A/B` 角色互换方案：`Hall B` 作为计数脚，`Hall A` 作为方向脚
+  - 仅在 `Hall B` 的下降沿记录一次有效事件
   - 在该时刻读取 `Hall A` 电平判定方向
-  - 按当前实测，`Hall B` 双边沿统计约为每圈 `8` 个有效事件
-  - 当前默认 `HALL_COUNT_EVENTS_PER_REV = 8`
-  - 若回退到 `Hall B` 单边沿统计，则同步改回 `HALL_COUNT_EVENTS_PER_REV = 4`
+  - 当前默认 `HALL_COUNT_EVENTS_PER_REV = 1`
 - 当前轮径按 `0.235 m` 计算，轮周长约 `0.738 m`
 - 当前阶段不启用 `PID`，只做真实测速与反馈替换
 
@@ -117,8 +116,8 @@
 - `period_3..period_0`：`last_period_us`，单位 `us`，32 位无符号，高字节在前
 - `fault_h/fault_l`：`fault_count` 低 16 位
 - `speed_h/speed_l`：霍尔计算速度，单位 `mm/s`，16 位有符号，高字节在前
-- `irq_3..irq_0`：`EXTI9_5_IRQHandler()` 进入次数
-- `cb_3..cb_0`：`HAL_GPIO_EXTI_Callback(HallA_Pin)` 命中次数
+- `irq_3..irq_0`：当前计数脚对应 EXTI 处理函数的进入次数
+- `cb_3..cb_0`：`HAL_GPIO_EXTI_Callback(HallB_Pin)` 命中次数
 - `edge_3..edge_0`：被 `HallSpeed_OnCountEvent()` 接受为有效边沿的次数
 
 ## 核心接口
