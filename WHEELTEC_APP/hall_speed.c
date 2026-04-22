@@ -1,6 +1,6 @@
 /**
  * @file hall_speed.c
- * @brief Hall speed measurement with Hall A edge counting and Hall B direction sampling.
+ * @brief Hall speed measurement with configurable count and direction channels.
  */
 
 #include "hall_speed.h"
@@ -10,7 +10,7 @@
 
 #define HALL_WHEEL_DIAMETER_M            0.235f
 #define HALL_WHEEL_CIRCUMFERENCE_M       (HALL_WHEEL_DIAMETER_M * 3.14159265358979f)
-#define HALL_COUNT_EVENTS_PER_REV        8U
+#define HALL_COUNT_EVENTS_PER_REV        1U
 #define HALL_MIN_EVENT_INTERVAL_US       1500U
 #define HALL_TIMEOUT_MIN_US           500000U
 #define HALL_TIMEOUT_MAX_US          4000000U
@@ -52,7 +52,7 @@ static uint32_t hall_speed_get_timeout_us(uint32_t last_period_us)
 	return (uint32_t)timeout_us;
 }
 
-static uint8_t hall_speed_get_b_active(void)
+static uint8_t hall_speed_get_dir_active(void)
 {
 	return (HAL_GPIO_ReadPin(hall_dir_gpio_port, hall_dir_pin) == GPIO_PIN_RESET) ? 1U : 0U;
 }
@@ -102,8 +102,8 @@ uint16_t HallSpeed_GetCountPin(void)
 void HallSpeed_OnCountEvent(void)
 {
 	const uint32_t now_us = hall_speed_get_time_us();
-	const uint8_t hall_b_active = hall_speed_get_b_active();
-	const uint8_t forward_active = (hall_b_active ^ HALL_DIR_INVERT) ? 0U : 1U;
+	const uint8_t dir_active = hall_speed_get_dir_active();
+	const uint8_t forward_active = (dir_active ^ HALL_DIR_INVERT) ? 0U : 1U;
 	const int8_t direction = (forward_active != 0U) ? 1 : -1;
 	const uint32_t last_event_us = g_hall_speed_state.last_event_us;
 

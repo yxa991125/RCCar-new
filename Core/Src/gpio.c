@@ -145,13 +145,13 @@ void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : HallB_Pin */
   GPIO_InitStruct.Pin = HallB_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(HallB_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : HallA_Pin */
   GPIO_InitStruct.Pin = HallA_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(HallA_GPIO_Port, &GPIO_InitStruct);
 

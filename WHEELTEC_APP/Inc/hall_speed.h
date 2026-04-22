@@ -1,6 +1,6 @@
 /**
  * @file hall_speed.h
- * @brief Hall wheel-speed measurement using PE9 count events and PE11 direction sampling.
+ * @brief Hall wheel-speed measurement with configurable count and direction channels.
  */
 
 #ifndef HALL_SPEED_H
