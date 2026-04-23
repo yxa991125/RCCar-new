@@ -45,6 +45,15 @@
 - 当前轮径按 `0.235 m` 计算，轮周长约 `0.738 m`
 - 当前阶段不启用 `PID`，只做真实测速与反馈替换
 
+### 5. 真实 `vx` 几何验证（预 PID 阶段）
+- 在进入 `PID` 调速之前，几何链路已经统一切到“真实 `vx` + 目标 `wz`”。
+- 当前实现：
+  - 实际控制侧：舵机目标按真实 `vx` 和目标 `wz` 计算
+  - 上报侧：`vx` 使用真实速度，`wz` 使用“真实 `vx` + 实际舵机角”的几何估算
+  - 调试侧：保留基于真实 `vx` 的影子舵角与几何状态变量，便于联调
+- 当前阶段仍不改变 `ESC` 开环控制，不进入 `PID`
+- 低速或测速无效时，不再回退到目标 `vx`；真实速度不可用时几何速度直接按 `0` 处理
+
 #### 霍尔输入电气前提
 - 双路霍尔信号均按 `3.3V` 上拉、低电平有效处理
 - 霍尔传感器与主控必须共地
@@ -93,6 +102,7 @@
 说明：
 - `vx/vy/wz` 由 `ServoBasic_GetOrinFeedback()` 提供
 - 阶段一启用霍尔轮速后，`vx` 优先使用真实轮速反馈
+- 预 PID 阶段中，`wz` 优先使用“真实 `vx` + 当前舵机角”的几何估算结果
 - `g_orin_feedback_scale` 只保留给旧的 PWM 估算反馈，不再作用于霍尔真轮速
 - 默认值为 `1254`（按千分比），即 `1.254x`
 - `battery` 单位为 mV
@@ -157,6 +167,14 @@
 - `g_hall_speed_state.last_period_us`
 - `g_hall_speed_state.direction`
 - `g_hall_speed_state.fault_count`
+- `g_real_vx_measured_raw_mps`
+- `g_real_vx_measured_filtered_mps`
+- `g_geometry_vx_mps`
+- `g_reported_wz_from_real_vx`
+- `g_shadow_servo_pulse_us`
+- `g_shadow_steering_rad`
+- `g_hall_feedback_valid`
+- `g_hall_fallback_active`（当前应长期为 `0`）
 - `g_rc_override_active`
 - `g_rc_guard_active`
 - `g_orin_state.active`

@@ -44,6 +44,8 @@ static servo_basic_state_t g_state = {
 #define ORIN_ESC_REVERSE_START_DEFAULT_US        1440U
 #define ORIN_ESC_FORWARD_MAX_DEFAULT_US          1650U
 #define ORIN_ESC_REVERSE_MAX_DEFAULT_US          1350U
+#define REAL_VX_GEOMETRY_FILTER_ALPHA_DEFAULT_PERMILLE 300U
+#define REAL_VX_GEOMETRY_MIN_VALID_DEFAULT_MMPS       500U
 #define RC_VALID_MIN_DEFAULT_US                   900U
 #define RC_VALID_MAX_DEFAULT_US                  2100U
 #define RC_FRAME_MIN_DEFAULT_US                  5000U
@@ -77,6 +79,8 @@ volatile uint32_t g_orin_feedback_scale = ORIN_FEEDBACK_SCALE_DEFAULT_PERMILLE;
 volatile uint32_t g_orin_vx_forward_cap_mmps = ORIN_VX_FORWARD_CAP_DEFAULT_MMPS;
 volatile uint32_t g_orin_vx_reverse_cap_mmps = ORIN_VX_REVERSE_CAP_DEFAULT_MMPS;
 volatile uint32_t g_orin_vx_deadband_mmps = ORIN_VX_DEADBAND_DEFAULT_MMPS;
+volatile uint32_t g_real_vx_geometry_filter_alpha_permille = REAL_VX_GEOMETRY_FILTER_ALPHA_DEFAULT_PERMILLE;
+volatile uint32_t g_real_vx_geometry_min_valid_mmps = REAL_VX_GEOMETRY_MIN_VALID_DEFAULT_MMPS;
 volatile uint32_t g_orin_vx_max_mmps = 1000U;
 volatile uint32_t g_orin_vz_max_millirad = 1000U;
 volatile uint32_t g_orin_esc_center_us = ESC_PWM_NEUTRAL_PULSE_US;
@@ -115,6 +119,14 @@ volatile uint32_t g_rc_steering_last_good_us = ESC_PWM_NEUTRAL_PULSE_US;
 volatile uint32_t g_rc_throttle_glitch_active = 0U;
 volatile uint32_t g_rc_steering_glitch_active = 0U;
 volatile uint32_t g_rc_input_fault_active = 0U;
+volatile float g_real_vx_measured_raw_mps = 0.0f;
+volatile float g_real_vx_measured_filtered_mps = 0.0f;
+volatile float g_geometry_vx_mps = 0.0f;
+volatile float g_reported_wz_from_real_vx = 0.0f;
+volatile float g_shadow_steering_rad = 0.0f;
+volatile uint32_t g_shadow_servo_pulse_us = ESC_PWM_NEUTRAL_PULSE_US;
+volatile uint32_t g_hall_feedback_valid = 0U;
+volatile uint32_t g_hall_fallback_active = 1U;
 
 typedef struct
 {
@@ -124,6 +136,9 @@ typedef struct
 	float feedback_vx_mps;
 	float feedback_vy_mps;
 	float feedback_vz_rad_s;
+	float target_vx_mps;
+	float target_vy_mps;
+	float target_vz_rad_s;
 	uint8_t active;
 	uint8_t stop;
 } orin_pwm_state_t;
@@ -144,6 +159,9 @@ static orin_pwm_state_t g_orin_state = {
 	ESC_PWM_NEUTRAL_PULSE_US,
 	ESC_PWM_NEUTRAL_PULSE_US,
 	0U,
+	0.0f,
+	0.0f,
+	0.0f,
 	0.0f,
 	0.0f,
 	0.0f,
@@ -170,6 +188,7 @@ static uint32_t get_rc_override_center_us(void);
 static uint8_t pulse_is_inside_center(uint16_t pulse_us, uint32_t center_us, uint32_t threshold_us);
 static uint8_t orin_pwm_is_active(void);
 static void servo_basic_apply_debug_command(uint32_t cmd, uint32_t value);
+static void update_geometry_feedback_state(void);
 
 __attribute__((weak)) void ServoBasic_OutputEscPulse(uint16_t pulse_us)
 {
@@ -621,6 +640,41 @@ static float get_orin_velocity_neutral_threshold_mps(void)
 	return (deadband_mps > min_vx_mps) ? deadband_mps : min_vx_mps;
 }
 
+static uint32_t get_real_vx_geometry_filter_alpha_permille(void)
+{
+	uint32_t alpha = g_real_vx_geometry_filter_alpha_permille;
+	if (alpha > 1000U)
+	{
+		alpha = 1000U;
+	}
+	return alpha;
+}
+
+static float get_real_vx_geometry_min_valid_mps(void)
+{
+	const uint32_t min_mmps = (g_real_vx_geometry_min_valid_mmps == 0U) ?
+		REAL_VX_GEOMETRY_MIN_VALID_DEFAULT_MMPS : g_real_vx_geometry_min_valid_mmps;
+	return (float)min_mmps / 1000.0f;
+}
+
+static float geometry_filter_vx(float previous_mps, float measured_mps, uint8_t *initialized)
+{
+	const float alpha = (float)get_real_vx_geometry_filter_alpha_permille() / 1000.0f;
+
+	if (initialized == NULL)
+	{
+		return measured_mps;
+	}
+	if (*initialized == 0U || alpha >= 1.0f ||
+		((previous_mps > 0.0f) && (measured_mps < 0.0f)) ||
+		((previous_mps < 0.0f) && (measured_mps > 0.0f)))
+	{
+		*initialized = 1U;
+		return measured_mps;
+	}
+	return previous_mps + alpha * (measured_mps - previous_mps);
+}
+
 static float scale_and_limit_orin_vx(float vx_mps)
 {
 	float scaled_vx = vx_mps * ((float)get_orin_vx_scale_permille() / 1000.0f);
@@ -656,6 +710,19 @@ static float clamp_legacy_orin_vz(float vz_rad_s)
 		return -max_rad_s;
 	}
 	return vz_rad_s;
+}
+
+static float get_active_target_wz_rad_s(void)
+{
+	if (g_state.emergency_stop != 0U || g_rc_override_active != 0U)
+	{
+		return 0.0f;
+	}
+	if (orin_pwm_is_active() == 0U || g_orin_state.stop != 0U)
+	{
+		return 0.0f;
+	}
+	return clamp_legacy_orin_vz(g_orin_state.target_vz_rad_s);
 }
 
 static uint16_t limit_esc_safe_pulse(uint16_t pulse_us)
@@ -891,6 +958,9 @@ void ServoBasic_Init(void)
 	g_orin_state.feedback_vx_mps = 0.0f;
 	g_orin_state.feedback_vy_mps = 0.0f;
 	g_orin_state.feedback_vz_rad_s = 0.0f;
+	g_orin_state.target_vx_mps = 0.0f;
+	g_orin_state.target_vy_mps = 0.0f;
+	g_orin_state.target_vz_rad_s = 0.0f;
 	g_orin_state.active = 0U;
 	g_orin_state.stop = 0U;
 	ServoRC_Capture_Init();
@@ -1021,9 +1091,6 @@ static float telemetry_estimate_vz_from_pwm(float vx_mps, uint16_t servo_pulse_u
 void ServoBasic_UpdateFromOrin(float vx_mps, float vy_mps, float vz_rad_s, uint8_t flag_stop)
 {
 	float scaled_vx_mps;
-	float limited_vz_rad_s = clamp_legacy_orin_vz(vz_rad_s);
-
-	(void)vy_mps;
 	(void)get_orin_ackermann_track_width_mm();
 	(void)get_orin_ackermann_wheel_radius_mm();
 	if (g_orin_pwm_enable == 0U)
@@ -1031,34 +1098,93 @@ void ServoBasic_UpdateFromOrin(float vx_mps, float vy_mps, float vz_rad_s, uint8
 		return;
 	}
 
+	g_orin_state.target_vx_mps = vx_mps;
+	g_orin_state.target_vy_mps = vy_mps;
+	g_orin_state.target_vz_rad_s = vz_rad_s;
+
 	scaled_vx_mps = scale_and_limit_orin_vx(vx_mps);
 	if (fabsf(scaled_vx_mps) < get_orin_velocity_neutral_threshold_mps())
 	{
 		g_orin_state.esc_pulse_us = get_orin_esc_center_pulse();
 		g_orin_state.servo_pulse_us = get_orin_servo_center_pulse();
-		g_orin_state.feedback_vx_mps = 0.0f;
-		g_orin_state.feedback_vy_mps = 0.0f;
-		g_orin_state.feedback_vz_rad_s = 0.0f;
 	}
 	else
 	{
 		g_orin_state.esc_pulse_us = orin_map_vx_to_esc(vx_mps);
 		g_orin_state.servo_pulse_us = orin_map_vz_to_servo(vx_mps, vz_rad_s);
-		g_orin_state.feedback_vx_mps = scaled_vx_mps;
-		g_orin_state.feedback_vy_mps = 0.0f;
-		g_orin_state.feedback_vz_rad_s = limited_vz_rad_s;
-	}
-
-	if (flag_stop != 0U)
-	{
-		g_orin_state.feedback_vx_mps = 0.0f;
-		g_orin_state.feedback_vy_mps = 0.0f;
-		g_orin_state.feedback_vz_rad_s = 0.0f;
 	}
 
 	g_orin_state.last_update_ms = HAL_GetTick();
 	g_orin_state.active = 1U;
 	g_orin_state.stop = (flag_stop != 0U) ? 1U : 0U;
+}
+
+static void update_geometry_feedback_state(void)
+{
+	static uint32_t s_last_update_ms = 0U;
+	static uint8_t s_filter_initialized = 0U;
+	float measured_vx_raw = 0.0f;
+	float measured_vx_filtered;
+	float geometry_vx;
+	float reported_wz;
+	uint8_t hall_valid;
+	float target_wz;
+	uint16_t geometry_servo_pulse;
+	const uint32_t now_ms = HAL_GetTick();
+
+	if (s_last_update_ms == now_ms)
+	{
+		return;
+	}
+	s_last_update_ms = now_ms;
+
+	hall_valid = HallSpeed_GetSignedSpeedMps(&measured_vx_raw);
+	if (hall_valid != 0U)
+	{
+		measured_vx_filtered = geometry_filter_vx(g_real_vx_measured_filtered_mps, measured_vx_raw, &s_filter_initialized);
+	}
+	else
+	{
+		measured_vx_filtered = 0.0f;
+		s_filter_initialized = 0U;
+	}
+
+	if ((hall_valid != 0U) && (fabsf(measured_vx_filtered) >= get_real_vx_geometry_min_valid_mps()))
+	{
+		geometry_vx = measured_vx_filtered;
+	}
+	else
+	{
+		geometry_vx = 0.0f;
+	}
+
+	if (g_state.emergency_stop != 0U || g_orin_state.stop != 0U)
+	{
+		geometry_vx = 0.0f;
+	}
+
+	target_wz = get_active_target_wz_rad_s();
+	geometry_servo_pulse = orin_map_vz_to_servo(geometry_vx, target_wz);
+	reported_wz = telemetry_estimate_vz_from_pwm(geometry_vx, geometry_servo_pulse);
+
+	if (g_rc_override_active == 0U && g_state.emergency_stop == 0U &&
+		orin_pwm_is_active() != 0U && g_orin_state.stop == 0U)
+	{
+		g_orin_state.servo_pulse_us = geometry_servo_pulse;
+	}
+
+	g_real_vx_measured_raw_mps = (hall_valid != 0U) ? measured_vx_raw : 0.0f;
+	g_real_vx_measured_filtered_mps = measured_vx_filtered;
+	g_geometry_vx_mps = geometry_vx;
+	g_reported_wz_from_real_vx = reported_wz;
+	g_shadow_steering_rad = telemetry_estimate_steering_rad_from_servo_pulse(geometry_servo_pulse);
+	g_shadow_servo_pulse_us = geometry_servo_pulse;
+	g_hall_feedback_valid = (uint32_t)hall_valid;
+	g_hall_fallback_active = 0U;
+
+	g_orin_state.feedback_vx_mps = geometry_vx;
+	g_orin_state.feedback_vy_mps = 0.0f;
+	g_orin_state.feedback_vz_rad_s = reported_wz;
 }
 
 static uint8_t orin_pwm_is_active(void)
@@ -1209,6 +1335,7 @@ void ServoBasic_ProcessControl(void)
 	{
 		apply_esc_pulse(ESC_PWM_MIN_PULSE_US);
 		apply_servo_pulse(get_orin_servo_center_pulse());
+		update_geometry_feedback_state();
 		return;
 	}
 	if (g_rc_override_active != 0U)
@@ -1240,6 +1367,8 @@ void ServoBasic_ProcessControl(void)
 			apply_servo_pulse(get_orin_servo_center_pulse());
 		}
 	}
+
+	update_geometry_feedback_state();
 }
 
 void ServoBasic_Task(void *param)
@@ -1317,15 +1446,18 @@ uint8_t ServoBasic_IsRcEmergencyActive(void)
 
 uint8_t ServoBasic_GetOrinFeedback(float *vx_mps, float *vy_mps, float *vz_rad_s)
 {
-	float feedback_vx = 0.0f;
-	float feedback_vz = 0.0f;
+	float feedback_vx;
+	float feedback_vz;
 
-	if (HallSpeed_GetSignedSpeedMps(&feedback_vx) == 0U)
+	update_geometry_feedback_state();
+
+	feedback_vx = g_orin_state.feedback_vx_mps;
+	feedback_vz = g_reported_wz_from_real_vx;
+
+	if (fabsf(feedback_vx) <= 0.0001f)
 	{
 		return 0U;
 	}
-
-	feedback_vz = telemetry_estimate_vz_from_pwm(feedback_vx, g_state.servo_pulse_us);
 
 	if (vx_mps != NULL)
 	{
